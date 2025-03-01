@@ -4,10 +4,40 @@ import threading
 import random
 import pygame
 from game import Game, Player
-from map import generate_map 
+from powerup import Powerup
+
 
 clients = []
 clients_lock = threading.Lock()
+shutdown_event = threading.Event()
+powerup_timers = {}
+powerup_lock = threading.Lock()
+
+def update_powerup_timers():
+    with powerup_lock:
+        for client_id in list(powerup_timers.keys()):
+            for effect in list(powerup_timers[client_id].keys()):
+                if powerup_timers[client_id][effect] is not None:
+                    powerup_timers[client_id][effect] -= 1
+                    print(f"Timer for client {client_id}, effect {effect}: {powerup_timers[client_id][effect]}")
+                    if powerup_timers[client_id][effect] <= 0:
+                        print(f"Removing {effect} effect from client {client_id}")
+                        with clients_lock:
+                            for cid, pl, _ in clients:
+                                if str(cid) == client_id:
+                                    if effect == "speed":
+                                        pl.speed /= 1.5
+                                        print(f"Speed reset for player {cid}")
+                                    elif effect == "ghost":
+                                        pl.ghost = False
+                                        pl.collision = True
+                                        print(f"Ghost reset for player {cid}")
+                                    elif effect == "shield":
+                                        pl.shield = False
+                                        print(f"Shield reset for player {cid}")
+                        del powerup_timers[client_id][effect]
+            if not powerup_timers[client_id]:
+                del powerup_timers[client_id]
 
 def is_valid_spawn(game_map, x, y):
     """Checks if the given coordinates are a valid spawn position (black cell)."""
@@ -18,7 +48,7 @@ def is_valid_spawn(game_map, x, y):
 def handle_client(conn, client_id, client_player):
     buffer = ""
     try:
-        while True:
+        while not shutdown_event.is_set():  # Check for shutdown signal
             data = conn.recv(1024).decode()
             if not data:
                 break
@@ -44,7 +74,7 @@ def handle_client(conn, client_id, client_player):
                     clients.pop(i)
                     break
 
-def broadcast_state(game, server_player):
+def broadcast_state(game, server_player, powerups):
     with clients_lock:
         state = {
             "type": "state",
@@ -58,11 +88,15 @@ def broadcast_state(game, server_player):
                 "clients": {
                     str(cid): {
                         "id": str(cid),
-                        "x": pl.x,
-                        "y": pl.y,
-                        "role": pl.role
+                        "x": pl.x - 0.4,
+                        "y": pl.y - 0.4,
+                        "role": pl.role,
+                        "ghost": pl.ghost,
+                        "shield": pl.shield,
+                        "speed": pl.speed
                     } for cid, pl, _ in clients
-                }
+                },
+                "powerups": powerups.powerup_positions
             }
         }
         msg = (json.dumps(state) + "\n").encode()
@@ -87,82 +121,127 @@ def check_tagging(game):
         with clients_lock:
             for cid, pl, _ in clients:
                 if pl.role == "runner" and abs(tagger.x - pl.x) < 0.5 and abs(tagger.y - pl.y) < 0.5:
-                    pl.role = "tagged"
-        # Check the server's local player.
-        if game.local_player.role == "runner" and abs(tagger.x - game.local_player.x) < 0.5 and abs(tagger.y - game.local_player.y) < 0.5:
-            game.local_player.role = "tagged"
+                    if pl.shield:
+                        return
+                    else:
+                        pl.role = "tagger"
 
 def accept_clients(server_socket, game, used_spawns):
     """Continuously accepts new clients and assigns them a spawn."""
     client_id_counter = 1
     tagger_assigned = False  # Flag to ensure only one tagger
 
-    while True:
-        conn, addr = server_socket.accept()
-        print(f"Client {client_id_counter} connected: {addr}")
-        # Send the map so the client can initialize its game state.
-        map_msg = json.dumps({"type": "map", "data": game.game_map}) + "\n"
+    while not shutdown_event.is_set():
         try:
-            conn.sendall(map_msg.encode())
+            conn, addr = server_socket.accept()
+            print(f"Client {client_id_counter} connected: {addr}")
+            # Send the map so the client can initialize its game state.
+            map_msg = json.dumps({"type": "map", "data": game.game_map}) + "\n"
+            try:
+                conn.sendall(map_msg.encode())
+            except Exception as e:
+                print("Error sending map:", e)
+                conn.close()
+                continue
+
+            # Send the client ID
+            id_msg = json.dumps({"type": "client_id", "data": client_id_counter}) + "\n"
+            try:
+                conn.sendall(id_msg.encode())
+            except Exception as e:
+                print("Error sending client ID:", e)
+                conn.close()
+                continue
+
+            # Find a valid spawn position.
+            while True:
+                x = random.randint(0, len(game.game_map[0]) - 1)
+                y = random.randint(0, len(game.game_map) - 1)
+                if is_valid_spawn(game.game_map, x, y):
+                    if client_id_counter == 2 and not tagger_assigned:  # Second client is tagger
+                        client_player = Player(float(x), float(y), role="tagger")
+                        tagger_assigned = True
+                    else:
+                        client_player = Player(float(x), float(y), role="runner")
+                    break
+
+
+            with clients_lock:
+                clients.append((client_id_counter, client_player, conn))
+            threading.Thread(target=handle_client, args=(conn, client_id_counter, client_player), daemon=True).start()
+            client_id_counter += 1
+        except socket.timeout:
+            continue # Continue to check the shutdown_event
         except Exception as e:
-            print("Error sending map:", e)
-            conn.close()
-            continue
-
-        # Send the client ID
-        id_msg = json.dumps({"type": "client_id", "data": client_id_counter}) + "\n"
-        try:
-            conn.sendall(id_msg.encode())
-        except Exception as e:
-            print("Error sending client ID:", e)
-            conn.close()
-            continue
-
-        # Find a valid spawn position.
-        # Find a valid spawn position.
-        while True:
-            x = random.randint(0, len(game.game_map[0]) - 1)
-            y = random.randint(0, len(game.game_map) - 1)
-            if is_valid_spawn(game.game_map, x, y):
-                if client_id_counter == 2 and not tagger_assigned:  # Second client is tagger
-                    client_player = Player(float(x), float(y), role="tagger")
-                    tagger_assigned = True
-                else:
-                    client_player = Player(float(x), float(y), role="runner")
-                break
-
-
-        with clients_lock:
-            clients.append((client_id_counter, client_player, conn))
-        threading.Thread(target=handle_client, args=(conn, client_id_counter, client_player), daemon=True).start()
-        client_id_counter += 1
+            print(f"Error accepting client: {e}")
+            break
 
 def main():
     port = int(input("Enter port: "))
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_socket.bind(('', port))
     server_socket.listen(5)  # Increase backlog if needed.
+    server_socket.settimeout(1) # Add a timeout so the server doesnt get stuck
     print(f"Server listening on port {port}")
 
     game = Game()
     used_spawns = set()
 
+    powerups = Powerup()
+    powerups.spawn_powerups()
+
     # Start accepting clients in a separate thread.
-    threading.Thread(target=accept_clients, args=(server_socket, game, used_spawns), daemon=True).start()
+    accept_thread = threading.Thread(target=accept_clients, args=(server_socket, game, used_spawns), daemon=True)
+    accept_thread.start()
 
     server_player = game.local_player
 
     # Main game loop: process input, update the game, render and broadcast state.
     running = True
-    while running:
-        running = game.display_map()  # This handles movement, rendering, and events.
-        server_player.x = game.local_player.x
-        server_player.y = game.local_player.y
-        server_player.role = game.local_player.role
-        broadcast_state(game, server_player)
-        check_tagging(game)
-    
-    pygame.quit()  # Cleanly exit pygame when done.
+    try:
+        while running:
+            running = game.display_map()  # This handles movement, rendering, and events.
+            server_player.x = 0.0
+            server_player.y = 0.0
+            server_player.role = game.local_player.role
+
+            with clients_lock:
+                for cid, pl, _ in clients:
+                    for powerup in powerups.powerup_positions[:]:
+                        powerup_pos = powerup['position']
+                        distance = ((pl.x - powerup_pos[0]) ** 2 + (pl.y - powerup_pos[1]) ** 2) ** 0.5
+                        if distance < 1:  # Player radius
+                            print(f"Player {cid} collected {powerup['type']} powerup")
+                            duration = powerups.apply_powerup_effect(powerup['type'], pl)
+                            client_id = str(cid)
+                            with powerup_lock:
+                                if client_id not in powerup_timers:
+                                    powerup_timers[client_id] = {}
+                                powerup_timers[client_id][powerup['type']] = duration
+                                print(f"Set timer for client {client_id}, effect {powerup['type']}: {duration}")
+                            powerups.powerup_positions.remove(powerup)
+
+# Add timer update before broadcast_state
+            update_powerup_timers()
+
+            broadcast_state(game, server_player, powerups)
+            check_tagging(game)
+    finally:
+        shutdown_event.set()  # Signal shutdown to all threads
+        print("Shutting down server...")
+
+        # Close all client connections
+        with clients_lock:
+            for _, _, conn in clients:
+                try:
+                    conn.close()
+                except Exception as e:
+                    print("Error closing client connection:", e)
+
+        server_socket.close()
+        accept_thread.join() # Wait for the accept thread to finish
+        pygame.quit()  # Cleanly exit pygame when done.
+        print("Server shutdown complete.")
 
 if __name__ == "__main__":
     main()
